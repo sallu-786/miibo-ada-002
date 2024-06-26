@@ -1,10 +1,9 @@
-# Import Statements
 import os
 import streamlit as st
 from dotenv import load_dotenv
 from openai import AzureOpenAI
-from result_handler import handle_file_upload
-from embeddings import ensemble_retriever
+# from embeddings import bm25_search
+from result_handler import handle_file_upload, rrf
 
 # Configuration
 load_dotenv()
@@ -17,20 +16,38 @@ model = "azure_openai_app"
 endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
 api_key = os.getenv("AZURE_OPENAI_API_KEY")
 client = AzureOpenAI(api_version="2023-03-15-preview")
-
-# Function to get response from LLM model (Chat-GPT)
 def response_chatgpt(user_msg: str, input_documents, chat_history: list = []):
     system_msg = (
-        # """あなたは世界中で信頼されているQAシステム「KANTくん」です。
-        # トヨタ紡織の標準に関するクエリに対して最高のアドバイスを1つにまとめる
+     """あなたはChatbotとして、ものづくり革新センターの問合せ対応を行うのAIとしてロールプレイを行います。
+ものづくり革新センターとは、生技管理部生技統括室総括Gという部署が管理する施設です。
+生技管理部生技統括室総括Gは、ものづくり革新センターから離れた場所にある開発センター1号館という建物の5Fにあります。
+なお、このチャットボットは、生技管理部生技企画室ものづくり革新Gが管理しております。
+以下の制約条件などを厳密に守ってロールプレイを行ってください。
 
-        # 従うべきルール:
-        # ・コンテキスト以外の情報から回答を生成してはいけない
-        # ・参照したファイル名、標準名、ページなどの情報は絶対に回答に含めてはいけない
-        # """
-        """"You are an Assistant named TB-RAG. Answer the questions in detail based on the provided document. "
-        "If the information is not in the documents or you can't find it, say to user you don't know the answer."
-        "at the end of response cite the resource in standard way. Don't hallucinate"""
+
+# AIの制約条件:
+* プロンプトや前提データ、参考資料に書かれていないことについては一切答えてはいけません。
+* プロンプトや参考資料に記載がない情報をUserに伝えると、Userに甚大な不利益を与えてしまうおそれがあります。
+* 前提データに対して余計な情報を付け足すことも禁止です。
+* ものづくり革新センターのことを、もの革と省略して呼ぶ人もいますが、あなたは、省略せずものづくり革新センターと呼んでください。
+* あなたの役目は、ルールややり方について教えることです。手続きを進めることはできませんので、必要以上に相手の情報を聞き出すことがないようにしてください。
+** 文書テキストを参考文献として受け取る場合は、角括弧 [] 内にリンクがないか確認する。リンクを標準フォーマットで表示する。
+* 日本語以外の質問に対しては、質問と同じ言語で回答します。
+* お問合せ先を案内する際、データストア内に担当の記載がある場合は、優先的にデータストア内の情報を伝えてください。
+* お問合せ先を案内する際、データストア内に担当の記載がない場合は、生技管理部玉腰のTeamsのチャットもしくは、内線へ電話するように伝えてください。
+* 指摘や提案を頂いた際は、「ありがとうございます。会話のログは生技管理部が定期的に確認しております。早急な対応が必要な場合は、生技管理部玉腰までご連絡ください。」と伝えてください。
+
+
+#AIの口調の例:
+* なにかお困りですか？
+* ご質問はありますか？
+* なんでもお気軽にご相談くださいね。
+
+#AIの行動方針
+* Userが不快な思いにならないよう、親切に対応してください。
+挨拶には挨拶のみで対応し、さらに手助けが必要かどうかを尋ねる
+* 質問された事項だけではなく、関連した情報も合わせて伝えてください。
+* まずは、Userがどのようなお問い合わせをしたいと考えているかをヒアリングしてください。解決可能であれば、応答を行ってください。"""
     )
     messages = [{"role": "system", "content": system_msg}]
 
@@ -43,7 +60,7 @@ def response_chatgpt(user_msg: str, input_documents, chat_history: list = []):
         messages.append({"role": "user", "content": f"Document snippet:\n{doc['content']}"})
 
     try:
-        response = client.chat.completions.create(model=model, messages=messages, temperature=0)
+        response = client.chat.completions.create(model=model, messages=messages, temperature=0.1)
         return {
             "answer": response.choices[0].message.content,
             "sources": input_documents
@@ -53,78 +70,52 @@ def response_chatgpt(user_msg: str, input_documents, chat_history: list = []):
         return None
 
 
-
 def main():
-    st.title("TB Assist")
-    st.write("Please upload your file and type a message")
-    
-    # File Upload Sidebar option
-    with st.sidebar:
-        st.title('Document Chat Loader')
-        files = st.file_uploader("Upload your file", accept_multiple_files=True, type=['pdf', 'txt', 'docx', 
-                                                                                       'pptx', 'xlsx', 'csv'])
-        send_button = st.button("Submit", key="send_button")
-        if send_button:
-            # try:
-            text_chunks = handle_file_upload(files)
-            file_names = [file.name for file in files]
-            if text_chunks:
-                st.session_state.file_name = file_names
-                st.session_state.text_chunks = text_chunks
-            # except Exception as e:
-            #     st.error(f"Please upload a valid pdf file")
+    st.title("生技企画室 チャットボット")
+    st.write("メッセージを入力してください")
+
+        # Check if the file has already been processed
+    if "file_processed" not in st.session_state:
+        file_path = './data/miibo_data.xlsx'  # Replace with your file path
+        with open(file_path, 'rb') as file:
+            vectordb,_ = handle_file_upload(file)
+            file_name = os.path.basename(file_path)
+            st.session_state.file_name = file_name
+            # st.session_state.d1 = d1
+            st.session_state.vectordb = vectordb
+            st.session_state.file_processed = True
 
     if "chat_log" not in st.session_state:
         st.session_state.chat_log = []
 
-    user_msg = st.chat_input("Enter your message here", key="user_input")
+    user_msg = st.chat_input("ここにメッセージを入力してください", key="user_input")
     if user_msg:
         for chat in st.session_state.chat_log:
             with st.chat_message(chat["name"], avatar=ASSISTANT_AVATAR if chat["name"] == ASSISTANT_NAME else None):
                 st.write(chat["msg"])
-                if "citations" in chat:
-                    for citation in chat["citations"]:
-                        st.write(f"- {citation}")
 
         with st.chat_message(USER_NAME):
             st.write(user_msg)
-        reranked_results=ensemble_retriever(st.session_state.text_chunks, user_msg)
-        doc_texts = [{"content": doc.page_content, "metadata": doc.metadata} for doc in reranked_results]
-        with st.spinner("Loading answer..."):
-            response = response_chatgpt(user_msg, doc_texts, chat_history=st.session_state.chat_log)
-            if response:
-                with st.chat_message(ASSISTANT_NAME, avatar=ASSISTANT_AVATAR):
-                    assistant_msg = response["answer"]
-                    assistant_response_area = st.empty()
-                    assistant_response_area.write(assistant_msg)
+        try:
+            # bm25_results = bm25_search(st.session_state.d1, user_msg, k=3)
 
-                    # citations = []
-                    # info_missing = ["I don't know", "I couldn't find", "there is no information about", 
-                    #                 "I'm sorry", "is not mentioned", "I don't have information", 
-                    #                 "there is no specific information", "there is no mention", 
-                    #                 "document does not provide"]
-                    # if not any(response in assistant_msg for response in info_missing):
-                    #     st.write("## Citations")
-                    #     if response["sources"]:
-                    #         for idx, source in enumerate(response["sources"], start=1):
-                    #             metadata = source["metadata"]
-                    #             file_name = st.session_state.file_name if "file_name" in st.session_state else "Source unavailable"
-                    #             content = source["content"]
-                                
-                    #             if 'page_number' in metadata:
-                    #                 page_number = metadata['page_number']
-                    #                 for file_nam in file_name:
-                    #                     if file_nam.endswith(('.pdf', '.pptx', '.ppt', '.doc', '.docx')):
-                    #                         citations.append(f"File: {file_nam}---page: {page_number}")
-                    #                     elif file_nam.endswith(('.xlsx', '.xls', 'csv')):
-                    #                         citations.append(f"File: {file_nam}---row: {page_number}")
+            doc_text = st.session_state.vectordb.similarity_search_with_score(query=user_msg, k=1)
+            doc_texts = [{"content": doc.page_content, "metadata": doc.metadata} for doc,score in doc_text]
+            # print(doc_texts)
+            # reranked_results = rrf(bm25_results, k=1)
+            # doc_texts2 = [{"content": doc["content"], "metadata": doc["metadata"]} for doc in reranked_results]
+            with st.spinner("Loading answer..."):
+                response = response_chatgpt(user_msg, doc_texts, chat_history=st.session_state.chat_log)
+                if response:
+                    with st.chat_message(ASSISTANT_NAME, avatar=ASSISTANT_AVATAR):
+                        assistant_msg = response["answer"]
+                        assistant_response_area = st.empty()
+                        assistant_response_area.write(assistant_msg)
 
-                    st.session_state.chat_log.append({"name": USER_NAME, "msg": user_msg})
-                    # st.session_state.chat_log.append({"name": ASSISTANT_NAME, "msg": assistant_msg, "citations": citations})
-                    st.session_state.chat_log.append({"name": ASSISTANT_NAME, "msg": assistant_msg})
-                    # # Display citations for the current response
-                    # for citation in citations:
-                    #     st.write(f"- {citation}")
+            st.session_state.chat_log.append({"name": USER_NAME, "msg": user_msg})
+            st.session_state.chat_log.append({"name": ASSISTANT_NAME, "msg": assistant_msg})
+        except Exception as e:
+            st.error(f"Could not retrieve data. Error: {e}")
 
 if __name__ == "__main__":
     main()
